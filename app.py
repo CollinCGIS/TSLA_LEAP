@@ -362,8 +362,54 @@ if not spy.empty and len(spy) > 63:
 else:
     tsla_ret_3m, spy_ret_3m = 0.0, 0.0
 
+# Fetching the list of expiration dates is cheap (one call, no chain data) —
+# do this early so the date-range picker below can be bounded by what's
+# actually available instead of a guess.
 expirations = tuple(fetch_option_expirations(TICKER))
-leaps_raw = fetch_leaps_chain(TICKER, expirations, lc.LEAPS_MIN_DAYS, lc.LEAPS_MAX_DAYS)
+today = datetime.now(timezone.utc).date()
+available_days = sorted(
+    (datetime.strptime(e, "%Y-%m-%d").date() - today).days for e in expirations
+) if expirations else []
+
+tab_overview, tab_options, tab_manage, tab_estimator = st.tabs(
+    ["📈 Overview & Score", "🎯 LEAP Selection & Sizing", "🔧 Manage Position", "🧮 Value Estimator"]
+)
+
+# The date-range and delta-view controls live in tab_options, but need to be
+# captured *before* the (expensive) chain fetch below runs — Streamlit
+# re-executes the whole script top-to-bottom on every interaction, so this
+# still works even though the rest of tab_options' content is written later.
+with tab_options:
+    st.markdown("### Which LEAP to buy")
+    if not available_days:
+        st.warning(
+            "Couldn't load TSLA's option expiration dates from Yahoo Finance this refresh — likely a "
+            "temporary rate limit (more common on shared cloud hosting than a home connection). "
+            "The slider below will show default bounds until data loads — try refreshing in a minute."
+        )
+        avail_min, avail_max = 7, 800  # safe fallback bounds so the slider always renders
+    else:
+        avail_min, avail_max = available_days[0], available_days[-1]
+
+    default_lo = min(max(lc.LEAPS_MIN_DAYS, avail_min), avail_max)
+    default_hi = min(max(lc.LEAPS_MAX_DAYS, avail_min), avail_max)
+    if default_lo > default_hi:
+        default_lo, default_hi = avail_min, avail_max
+
+    selected_min_days, selected_max_days = st.slider(
+        "Days to expiration", min_value=avail_min, max_value=avail_max,
+        value=(default_lo, default_hi), step=1, key="day_range_slider",
+        help="Defaults to the 12-14 month LEAPS window (335-440 days). Widen this to see "
+             "shorter- or longer-dated contracts too — everything in range gets fetched and graded.",
+    )
+    view_delta_min, view_delta_max = st.slider(
+        "Delta range to display in the table below", min_value=0.05, max_value=0.99,
+        value=(lc.DELTA_MIN, lc.DELTA_MAX), step=0.01, key="delta_view_slider",
+        help="This only narrows what's shown in the browse table — grading (and the top picks above "
+             "it) always uses the full fetched set, so a great contract outside this range still surfaces.",
+    )
+
+leaps_raw = fetch_leaps_chain(TICKER, expirations, selected_min_days, selected_max_days)
 
 # Earnings date: prefer Alpha Vantage's EARNINGS_CALENDAR (more reliable), fall
 # back to yfinance if no AV key is set or the AV call fails.
@@ -385,7 +431,7 @@ news_sentiment_raw, news_source = fetch_av_news_sentiment(TICKER)
 earnings_surprise_pct, earnings_surprise_source = fetch_av_earnings_surprise(TICKER)
 
 current_iv = None
-valid_options = pd.DataFrame()
+all_scored = pd.DataFrame()
 if not leaps_raw.empty:
     leaps_raw = leaps_raw.dropna(subset=["strike", "impliedVolatility"])
     leaps_raw = leaps_raw[leaps_raw["impliedVolatility"] > 0]
@@ -400,19 +446,31 @@ if not leaps_raw.empty:
     )
     leaps_raw[["bs_price", "delta", "gamma", "theta"]] = greeks
 
-    # liquidity filter: require at least some open interest so we're not
-    # sizing a real trade off a strike nobody trades
-    liquid = leaps_raw[leaps_raw["openInterest"].fillna(0) > 0].copy()
-    pool = liquid if not liquid.empty else leaps_raw
-
-    valid_options = pool[(pool["delta"] >= lc.DELTA_MIN) & (pool["delta"] <= lc.DELTA_MAX)].copy()
-    valid_options["delta_dist"] = (valid_options["delta"] - lc.DELTA_TARGET).abs()
-    valid_options = valid_options.sort_values("delta_dist")
-
-    # current IV gauge: average IV of near-the-money LEAPS in our window
-    atm = pool.iloc[(pool["strike"] - price).abs().argsort()[:5]]
+    # current IV gauge: average IV of near-the-money contracts in the fetched window
+    atm = leaps_raw.iloc[(leaps_raw["strike"] - price).abs().argsort()[:5]]
     if not atm.empty:
         current_iv = float(atm["impliedVolatility"].mean())
+
+    # No hard delta/liquidity filtering here anymore — every contract that was
+    # actually fetched gets graded, including ones far outside the "ideal"
+    # band or with poor liquidity; they just score (and rank) lower instead
+    # of silently vanishing.
+    pool_avg_iv_for_scoring = float(leaps_raw["impliedVolatility"].mean())
+    contract_scores = leaps_raw.apply(
+        lambda row: lc.compute_contract_score(
+            delta=row["delta"], open_interest=row["openInterest"],
+            bid=row["bid"], ask=row["ask"],
+            contract_iv=row["impliedVolatility"], pool_avg_iv=pool_avg_iv_for_scoring,
+        ),
+        axis=1,
+    )
+    all_scored = leaps_raw.copy()
+    all_scored["contract_score"] = [c["total"] for c in contract_scores]
+    all_scored["contract_grade"] = [c["grade"] for c in contract_scores]
+    all_scored["delta_fit_score"] = [c["delta_fit"] for c in contract_scores]
+    all_scored["liquidity_score"] = [c["liquidity"] for c in contract_scores]
+    all_scored["iv_cost_score"] = [c["iv_cost"] for c in contract_scores]
+    all_scored = all_scored.sort_values("contract_score", ascending=False).reset_index(drop=True)
 
 # ---------------------------------------------------------------------------
 # Scoring
@@ -435,30 +493,17 @@ total = lc.compute_total_score(scores)
 buy = lc.buy_signal(scores, total, earnings_blackout=earnings_blackout)
 entry_grade = lc.letter_grade(total)
 
-if not valid_options.empty:
-    pool_avg_iv_for_scoring = float(valid_options["impliedVolatility"].mean())
-    contract_scores = valid_options.apply(
-        lambda row: lc.compute_contract_score(
-            delta=row["delta"], open_interest=row["openInterest"],
-            bid=row["bid"], ask=row["ask"],
-            contract_iv=row["impliedVolatility"], pool_avg_iv=pool_avg_iv_for_scoring,
-        ),
-        axis=1,
-    )
-    valid_options["contract_score"] = [c["total"] for c in contract_scores]
-    valid_options["contract_grade"] = [c["grade"] for c in contract_scores]
-    valid_options["delta_fit_score"] = [c["delta_fit"] for c in contract_scores]
-    valid_options["liquidity_score"] = [c["liquidity"] for c in contract_scores]
-    valid_options["iv_cost_score"] = [c["iv_cost"] for c in contract_scores]
-    valid_options = valid_options.sort_values("contract_score", ascending=False)
+# Top picks and best_option ignore the delta-view slider entirely — they're
+# drawn from everything fetched in the selected date range, so a great
+# contract outside the "ideal" band still surfaces at the top.
+top_recommendations = all_scored.head(5) if not all_scored.empty else all_scored
+best_option = all_scored.iloc[0] if not all_scored.empty else None
+selected_contract = None  # set inside tab_options below once a contract is chosen/defaulted
 
-best_option = valid_options.iloc[0] if not valid_options.empty else None
-
-# ---------------------------------------------------------------------------
-# Tabs
-# ---------------------------------------------------------------------------
-tab_overview, tab_options, tab_manage, tab_estimator = st.tabs(
-    ["📈 Overview & Score", "🎯 LEAP Selection & Sizing", "🔧 Manage Position", "🧮 Value Estimator"]
+# The browse table *does* respect the delta-view slider, purely for display.
+browsed_options = (
+    all_scored[(all_scored["delta"] >= view_delta_min) & (all_scored["delta"] <= view_delta_max)]
+    if not all_scored.empty else all_scored
 )
 
 # --- Overview tab -----------------------------------------------------------
@@ -511,7 +556,7 @@ with tab_overview:
         "Weight": [f"{lc.SCORE_WEIGHTS[k]*100:.0f}%" for k in factor_order],
         "Score": [round(scores[k], 1) for k in factor_order],
     })
-    st.dataframe(score_df, hide_index=True, use_container_width=True)
+    st.dataframe(score_df, hide_index=True, width='stretch')
 
     with st.expander("Data sources behind each factor this refresh"):
         st.markdown(
@@ -532,7 +577,7 @@ with tab_overview:
     fig.add_scatter(x=tsla.tail(400).index, y=tsla["MA_20"].tail(400), mode="lines", name="20-day MA")
     fig.add_scatter(x=tsla.tail(400).index, y=tsla["MA_50"].tail(400), mode="lines", name="50-day MA")
     fig.add_scatter(x=tsla.tail(400).index, y=tsla["MA_200"].tail(400), mode="lines", name="200-day MA")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
     with st.expander("How each score is calculated"):
         st.markdown(
@@ -559,65 +604,85 @@ with tab_overview:
             "yfinance if unavailable."
         )
 
-# --- Options / sizing tab ---------------------------------------------------
+# --- Options / sizing tab (results, continued from the controls above) -----
 with tab_options:
-    st.markdown(f"### Which LEAP to buy — {lc.LEAPS_MIN_DAYS}-{lc.LEAPS_MAX_DAYS} days out, "
-                f"delta {lc.DELTA_MIN:.2f}-{lc.DELTA_MAX:.2f} (target ~{lc.DELTA_TARGET:.2f})")
-
-    if valid_options.empty:
+    if all_scored.empty:
         if not expirations:
             st.error(
                 "Couldn't load TSLA's options data from Yahoo Finance this refresh — likely a temporary "
                 "rate limit (more common on shared cloud hosting than a home connection). This isn't a "
-                "real 'no LEAPS exist' situation — click the refresh icon in the top right, or just "
+                "real 'no contracts exist' situation — click the refresh icon in the top right, or just "
                 "reload the page in a minute or two."
             )
         else:
-            st.error(f"No LEAPS in the {lc.LEAPS_MIN_DAYS}-{lc.LEAPS_MAX_DAYS} day / "
-                     f"{lc.DELTA_MIN:.2f}-{lc.DELTA_MAX:.2f} delta window were found in the option chain "
-                     "that did load. Try again shortly, or the window may need widening.")
+            st.error(f"No option contracts were found expiring in the {selected_min_days}-{selected_max_days} "
+                      "day range you selected above. Try widening the range.")
     else:
-        best = best_option
-        st.markdown("#### Top-Rated Contract")
-        st.success(
-            f"**Grade {best['contract_grade']} ({best['contract_score']:.0f}/100)** — "
-            f"**{TICKER} {best['expiration']} ${best['strike']:.0f} Call** — "
-            f"Delta {best['delta']:.3f}, IV {best['impliedVolatility']*100:.1f}%, "
-            f"Last ${best['lastPrice']:.2f}, {int(best['days_to_expiry'])} days to expiry, "
-            f"Open Interest {int(best['openInterest']) if not np.isnan(best['openInterest']) else 'n/a'}."
-        )
-        bc1, bc2, bc3 = st.columns(3)
-        bc1.metric("Delta Fit", f"{best['delta_fit_score']:.0f}/100")
-        bc2.metric("Liquidity", f"{best['liquidity_score']:.0f}/100")
-        bc3.metric("IV Cost (vs peers)", f"{best['iv_cost_score']:.0f}/100")
+        st.markdown("#### Top Picks (across all fetched contracts, regardless of the delta filter below)")
+        for _, row in top_recommendations.iterrows():
+            st.success(
+                f"**Grade {row['contract_grade']} ({row['contract_score']:.0f}/100)** — "
+                f"**{TICKER} {row['expiration']} ${row['strike']:.0f} Call** — "
+                f"Delta {row['delta']:.3f}, IV {row['impliedVolatility']*100:.1f}%, "
+                f"Last ${row['lastPrice']:.2f}, {int(row['days_to_expiry'])} days to expiry, "
+                f"OI {int(row['openInterest']) if not np.isnan(row['openInterest']) else 'n/a'}."
+            )
         st.caption(
-            "Ranked by a combined contract score — 50% how close delta is to target, 30% liquidity "
-            "(open interest + bid-ask spread tightness), 20% how cheap this contract's IV is relative "
-            "to the other candidates in this window. This is a *different* rating from the composite "
-            "entry-timing score above: that one asks 'should I buy a LEAP at all right now', this one "
-            "asks 'given that I'm buying, which specific contract is the best pick'."
+            "Ranked by a combined contract score — 50% how close delta is to the ~0.71 LEAPS target, "
+            "30% liquidity (open interest + bid-ask spread tightness), 20% how cheap this contract's IV "
+            "is relative to the other candidates fetched. This is a *different* rating from the composite "
+            "entry-timing score in the Overview tab: that one asks 'should I buy a LEAP at all right now', "
+            "this one asks 'given that I'm buying, which specific contract is the best pick'."
         )
 
-        st.markdown("#### All Candidates, Ranked")
-        display_cols = ["expiration", "days_to_expiry", "strike", "delta", "contract_score", "contract_grade",
-                         "impliedVolatility", "lastPrice", "bid", "ask", "openInterest", "volume"]
-        ranked_display = valid_options[display_cols].rename(columns={
-            "impliedVolatility": "IV", "lastPrice": "Last", "openInterest": "OpenInt",
-            "contract_score": "Score", "contract_grade": "Grade",
-        }).round({"delta": 3, "IV": 3, "Score": 1})
-        st.dataframe(
-            ranked_display.style.background_gradient(subset=["Score"], cmap="RdYlGn", vmin=0, vmax=100),
-            hide_index=True, use_container_width=True,
+        st.markdown("#### Choose a Contract to Size")
+        contract_labels = {
+            row["contractSymbol"]: (
+                f"Grade {row['contract_grade']} ({row['contract_score']:.0f}) — {row['expiration']} "
+                f"${row['strike']:.0f}C, Δ{row['delta']:.2f}, {int(row['days_to_expiry'])}d, "
+                f"${row['lastPrice']:.2f}"
+            )
+            for _, row in all_scored.iterrows()
+        }
+        default_symbol = all_scored.iloc[0]["contractSymbol"]
+        selected_symbol = st.selectbox(
+            "Defaults to the top-rated contract above — pick any other contract from everything fetched "
+            "to size or analyze it instead:",
+            options=list(contract_labels.keys()),
+            index=list(contract_labels.keys()).index(default_symbol),
+            format_func=lambda s: contract_labels[s],
         )
+        selected_contract = all_scored[all_scored["contractSymbol"] == selected_symbol].iloc[0]
 
-        fig2 = px.scatter(valid_options, x="strike", y="delta", color="contract_score",
-                           color_continuous_scale="RdYlGn", range_color=[0, 100],
-                           size="openInterest", hover_data=["expiration", "lastPrice", "days_to_expiry"],
-                           title="Candidate LEAPS — Delta vs Strike, colored by contract score")
-        st.plotly_chart(fig2, use_container_width=True)
+        st.markdown("#### Browse All Candidates")
+        st.caption(f"Showing contracts with delta between {view_delta_min:.2f} and {view_delta_max:.2f} "
+                    f"(adjust the slider above tab content to widen this) — {len(browsed_options)} of "
+                    f"{len(all_scored)} fetched contracts match.")
+        if browsed_options.empty:
+            st.info("No fetched contracts fall in the selected delta range — widen the delta slider above.")
+        else:
+            display_cols = ["expiration", "days_to_expiry", "strike", "delta", "contract_score", "contract_grade",
+                             "impliedVolatility", "lastPrice", "bid", "ask", "openInterest", "volume"]
+            ranked_display = browsed_options[display_cols].rename(columns={
+                "impliedVolatility": "IV", "lastPrice": "Last", "openInterest": "OpenInt",
+                "contract_score": "Score", "contract_grade": "Grade",
+            }).round({"delta": 3, "IV": 3, "Score": 1})
+            st.dataframe(
+                ranked_display.style.background_gradient(subset=["Score"], cmap="RdYlGn", vmin=0, vmax=100),
+                hide_index=True, width='stretch',
+            )
+
+            fig2 = px.scatter(browsed_options, x="strike", y="delta", color="contract_score",
+                               color_continuous_scale="RdYlGn", range_color=[0, 100],
+                               size="openInterest", hover_data=["expiration", "lastPrice", "days_to_expiry"],
+                               title="Candidate LEAPS — Delta vs Strike, colored by contract score")
+            st.plotly_chart(fig2, width='stretch')
 
         st.markdown("### How much to buy")
-        premium = float(best["lastPrice"]) if best["lastPrice"] > 0 else float(best["ask"])
+        st.caption(f"Sizing the selected contract: {TICKER} {selected_contract['expiration']} "
+                    f"${selected_contract['strike']:.0f} Call")
+        premium = (float(selected_contract["lastPrice"]) if selected_contract["lastPrice"] > 0
+                   else float(selected_contract["ask"]))
         sizing = lc.position_size(portfolio_value, premium, risk_per_trade, stop_loss_pct, max_alloc_pct)
 
         sc1, sc2, sc3 = st.columns(3)
@@ -704,9 +769,9 @@ with tab_manage:
 # --- Value estimator tab -----------------------------------------------------
 with tab_estimator:
     st.markdown("### How the option's value changes as TSLA's price moves")
-    default_strike = float(best_option["strike"]) if best_option is not None else round(price, -1)
-    default_days = int(best_option["days_to_expiry"]) if best_option is not None else 365
-    default_iv = float(best_option["impliedVolatility"]) if best_option is not None else (current_iv or 0.5)
+    default_strike = float(selected_contract["strike"]) if selected_contract is not None else round(price, -1)
+    default_days = int(selected_contract["days_to_expiry"]) if selected_contract is not None else 365
+    default_iv = float(selected_contract["impliedVolatility"]) if selected_contract is not None else (current_iv or 0.5)
 
     e1, e2, e3 = st.columns(3)
     est_strike = e1.number_input("Strike", value=default_strike, step=5.0)
@@ -725,7 +790,7 @@ with tab_estimator:
     fig3.add_vline(x=price, line_dash="dot", annotation_text="Current price")
     fig3.update_layout(title=f"Theoretical value of the ${est_strike:.0f} call as TSLA price moves",
                         xaxis_title="TSLA Price", yaxis_title="Option Value ($/share, x100 per contract)")
-    st.plotly_chart(fig3, use_container_width=True)
+    st.plotly_chart(fig3, width='stretch')
     st.caption(
         "Uses Black-Scholes with the IV assumption above, held constant across price scenarios "
         "(in reality IV itself moves with price and time — this is a simplification)."
