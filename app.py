@@ -14,6 +14,7 @@ financial advice, and it does not place trades.
 """
 import io
 import os
+import time
 from datetime import datetime, timezone
 
 import numpy as np
@@ -66,9 +67,30 @@ with st.sidebar:
 # Data fetching (cached)
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=900, show_spinner="Fetching TSLA price history...")
+def _yf_retry(func, retries: int = 2, base_delay: float = 1.5):
+    """Small retry-with-backoff wrapper for yfinance calls. Yahoo Finance
+    (an unofficial, keyless data source) intermittently rate-limits requests
+    — this is *more* likely on shared cloud hosting like Streamlit Community
+    Cloud, where many apps share the same outbound IP, than on a home
+    connection. Retries a couple of times with a short pause before giving
+    up, rather than failing on the first hiccup."""
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            return func()
+        except Exception as e:
+            last_exc = e
+            if attempt < retries:
+                time.sleep(base_delay * (attempt + 1))
+    raise last_exc
+
+
+@st.cache_data(ttl=1800, show_spinner="Fetching TSLA price history...")
 def fetch_price_history(ticker: str, period: str = "2y") -> pd.DataFrame:
-    df = yf.Ticker(ticker).history(period=period, auto_adjust=True)
+    try:
+        df = _yf_retry(lambda: yf.Ticker(ticker).history(period=period, auto_adjust=True))
+    except Exception:
+        return pd.DataFrame()  # caller checks .empty and shows a clear message — never crashes the page
     if df.empty:
         return df
     df["MA_20"] = df["Close"].rolling(20).mean()
@@ -91,12 +113,15 @@ def fetch_price_history(ticker: str, period: str = "2y") -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_option_expirations(ticker: str) -> list[str]:
-    return list(yf.Ticker(ticker).options)
+    try:
+        return list(_yf_retry(lambda: yf.Ticker(ticker).options))
+    except Exception:
+        return []  # caller treats this the same as "no LEAPS found" and explains why
 
 
-@st.cache_data(ttl=900, show_spinner="Fetching LEAPS option chain...")
+@st.cache_data(ttl=1800, show_spinner="Fetching LEAPS option chain...")
 def fetch_leaps_chain(ticker: str, expirations: tuple[str, ...],
                        min_days: int, max_days: int) -> pd.DataFrame:
     today = datetime.now(timezone.utc).date()
@@ -108,7 +133,7 @@ def fetch_leaps_chain(ticker: str, expirations: tuple[str, ...],
         if not (min_days <= days <= max_days):
             continue
         try:
-            chain = tk.option_chain(exp)
+            chain = _yf_retry(lambda: tk.option_chain(exp), retries=1)
         except Exception:
             continue
         calls = chain.calls.copy()
@@ -132,7 +157,7 @@ def fetch_leaps_chain(ticker: str, expirations: tuple[str, ...],
 def fetch_days_to_next_earnings(ticker: str) -> int | None:
     """Days until the next earnings report, or None if unavailable."""
     try:
-        edf = yf.Ticker(ticker).get_earnings_dates(limit=8)
+        edf = _yf_retry(lambda: yf.Ticker(ticker).get_earnings_dates(limit=8))
         if edf is None or edf.empty:
             return None
         today = pd.Timestamp.now(tz=edf.index.tz) if edf.index.tz else pd.Timestamp.now()
@@ -145,16 +170,16 @@ def fetch_days_to_next_earnings(ticker: str) -> int | None:
         return None
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_near_term_put_call_ratio(ticker: str) -> float | None:
     """Real put/call *volume* ratio from the nearest available expiration,
     as an actual sentiment read rather than a placeholder."""
     try:
         tk = yf.Ticker(ticker)
-        exps = tk.options
+        exps = _yf_retry(lambda: tk.options)
         if not exps:
             return None
-        chain = tk.option_chain(exps[0])
+        chain = _yf_retry(lambda: tk.option_chain(exps[0]), retries=1)
         call_vol = pd.to_numeric(chain.calls["volume"], errors="coerce").fillna(0).sum()
         put_vol = pd.to_numeric(chain.puts["volume"], errors="coerce").fillna(0).sum()
         if call_vol <= 0:
@@ -162,6 +187,7 @@ def fetch_near_term_put_call_ratio(ticker: str) -> float | None:
         return float(put_vol / call_vol)
     except Exception:
         return None
+
 
 
 FRED_SERIES_ID = "DGS1"  # 1-year constant-maturity Treasury: closest tenor match to a 12-14mo LEAP
@@ -539,8 +565,17 @@ with tab_options:
                 f"delta {lc.DELTA_MIN:.2f}-{lc.DELTA_MAX:.2f} (target ~{lc.DELTA_TARGET:.2f})")
 
     if valid_options.empty:
-        st.error("No LEAPS in the target window/delta band were found right now "
-                  "(or the option chain didn't load). Try again shortly.")
+        if not expirations:
+            st.error(
+                "Couldn't load TSLA's options data from Yahoo Finance this refresh — likely a temporary "
+                "rate limit (more common on shared cloud hosting than a home connection). This isn't a "
+                "real 'no LEAPS exist' situation — click the refresh icon in the top right, or just "
+                "reload the page in a minute or two."
+            )
+        else:
+            st.error(f"No LEAPS in the {lc.LEAPS_MIN_DAYS}-{lc.LEAPS_MAX_DAYS} day / "
+                     f"{lc.DELTA_MIN:.2f}-{lc.DELTA_MAX:.2f} delta window were found in the option chain "
+                     "that did load. Try again shortly, or the window may need widening.")
     else:
         best = best_option
         st.markdown("#### Top-Rated Contract")

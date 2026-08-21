@@ -227,3 +227,20 @@ what changed and what didn't, and why:
 - All thresholds (score cutoffs, delta band, pullback %, stop-loss %) are
   constants/sidebar inputs you should sanity-check and adjust to your own
   risk tolerance rather than trust blindly.
+- **Yahoo Finance rate limiting** (`yfinance.exceptions.YFRateLimitError`):
+  yfinance is an unofficial, keyless scraper of Yahoo's endpoints, not a
+  supported API. Yahoo rate-limits it more aggressively on shared cloud IPs
+  (like Streamlit Community Cloud's free tier, where many apps share the
+  same outbound address) than on a home connection. Every yfinance call in
+  `app.py` retries a couple of times with a short backoff and fails
+  gracefully into an empty result with a clear on-screen explanation rather
+  than crashing the app — but if Yahoo is actively blocking that shared IP
+  range, no amount of retrying inside the app will force data through. If
+  you see the rate-limit message repeatedly:
+  - Wait a few minutes and refresh — this is usually temporary.
+  - It's typically less frequent when running locally, since your home IP
+    isn't shared with other apps' traffic.
+  - If it becomes a persistent problem on your deployment, the real fix is
+    a paid/keyed data source for the options chain (Tradier was flagged
+    earlier in this project as the best free-to-start upgrade path) rather
+    than working around yfinance further.
